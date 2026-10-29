@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>触碰水面 · 真实水波纹</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #02060d; }
+  body { font-family: -apple-system, sans-serif; color: #fff; }
+  #app { position: fixed; inset: 0; touch-action: none; }
+  #cam { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  
+  .hud { position: fixed; top: 24px; left: 24px; padding: 16px 20px; border-radius: 16px; background: rgba(5, 15, 30, 0.5); border: 1px solid rgba(100, 200, 255, 0.15); backdrop-filter: blur(10px); pointer-events: none; z-index: 10; }
+  .hud .title { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: #a0e0ff; text-shadow: 0 0 10px rgba(100, 200, 255, 0.5); }
+  .hud .sub { margin-top: 6px; font-size: 11px; color: rgba(200, 240, 255, 0.6); }
+  
+  .preview-wrap { position: fixed; right: 20px; bottom: 20px; width: 160px; height: 120px; border-radius: 12px; overflow: hidden; border: 1px solid rgba(100, 200, 255, 0.2); box-shadow: 0 10px 30px rgba(0,0,0,0.5); background: #000; transition: opacity 0.5s ease; transform: scaleX(-1); z-index: 10; opacity: 0; }
+  .preview-wrap.active { opacity: 1; }
+  #preview { display: block; width: 100%; height: 100%; }
+  
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #02060d; z-index: 50; transition: opacity 0.8s ease; }
+  #loading.done { opacity: 0; pointer-events: none; }
+  .spinner { width: 40px; height: 40px; border-radius: 50%; border: 2px solid rgba(0, 180, 219, 0.2); border-top-color: #64ffda; animation: spin 1s linear infinite; margin-bottom: 16px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .text { font-size: 13px; letter-spacing: 2px; color: #64ffda; }
+  @media (max-width: 640px) {
+    .preview-wrap { width: 120px; height: 90px; }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<video id="cam" playsinline muted autoplay></video>
+
+<div class="hud">
+  <div class="title">触碰水面</div>
+  <div class="sub">滑动屏幕或挥手 · 划开真实水波</div>
+</div>
+<div class="preview-wrap" id="previewWrap"><canvas id="preview" width="160" height="120"></canvas></div>
+<div id="loading"><div class="spinner"></div><div class="text">正在注水…</div></div>
+
+<script src="https://fastly.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://fastly.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ================= 基础场景 =================
+const container = document.getElementById('app');
+const scene = new THREE.Scene();
+// 深邃的海水背景
+scene.background = new THREE.Color(0x02060d);
+scene.fog = new THREE.FogExp2(0x02060d, 0.05);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+// 降低视角，贴近水面，增强透视感
+camera.position.set(0, 3.5, 6);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+container.appendChild(renderer.domElement);
+
+// ================= 渲染目标 (Ping-Pong FBO 用于高度场) =================
+// 使用浮点纹理存储水面的高度
+const rtSize = 256;
+const rtOptions = {
+  minFilter: THREE.LinearFilter,
+  magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, // 兼容性更好
+  type: THREE.FloatType,
+  depthBuffer: false,
+  stencilBuffer: false
+};
+
+let rtA = new THREE.WebGLRenderTarget(rtSize, rtSize, rtOptions);
+let rtB = new THREE.WebGLRenderTarget(rtSize, rtSize, rtOptions);
+
+// 初始化清空
+renderer.setRenderTarget(rtA);
+renderer.clear();
+renderer.setRenderTarget(rtB);
+renderer.clear();
+renderer.setRenderTarget(null);
+
+// ================= 水波更新 Shader =================
+const updateScene = new THREE.Scene();
+const updateCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const updateGeo = new THREE.PlaneGeometry(2, 2);
+
+const updateMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uPrev: { value: null },
+    uCurrent: { value: null },
+    uMouse: { value: new THREE.Vector2(0.5, 0.5) },
+    uIsTouching: { value: 0.0 },
+    uAspect: { value: window.innerWidth / window.innerHeight },
+    uTime: { value: 0 }
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
+  `,
+  fragmentShader: `
+    uniform sampler2D uPrev;
+    uniform sampler2D uCurrent;
+    uniform vec2 uMouse;
+    uniform float uIsTouching;
+    uniform float uAspect;
+    uniform float uTime;
+    varying vec2 vUv;
+
+    void main() {
+      vec2 texel = vec2(1.0 / 256.0, 1.0 / 256.0);
+      
+      // 获取中心点和四周的高度
+      float prev = texture2D(uPrev, vUv).r;
+      float curr = texture2D(uCurrent, vUv).r;
+      
+      float left = texture2D(uCurrent, vUv - vec2(texel.x, 0.0)).r;
+      float right = texture2D(uCurrent, vUv + vec2(texel.x, 0.0)).r;
+      float top = texture2D(uCurrent, vUv - vec2(0.0, texel.y)).r;
+      float bottom = texture2D(uCurrent, vUv + vec2(0.0, texel.y)).r;
+      
+      // 核心波动方程: 周围平均值 - 上一帧高度
+      float newHeight = (left + right + top + bottom) / 2.0 - prev;
+      
+      // 水体的阻尼衰减（慢慢平静下来）
+      newHeight *= 0.96; 
+      
+      // 触摸产生涟漪
+      if (uIsTouching > 0.0) {
+        // 处理屏幕宽高比，保证涟漪是正圆形
+        vec2 dir = vUv - uMouse;
+        dir.x *= uAspect;
+        float dist = length(dir);
+        
+        // 产生一个平滑的按压凹陷（水滴）
+        float brush = smoothstep(0.05, 0.0, dist);
+        newHeight -= brush * 1.5; 
+      }
+      
+      gl_FragColor = vec4(newHeight, 0.0, 0.0, 1.0);
+    }
+  `
+});
+
+const updateMesh = new THREE.Mesh(updateGeo, updateMat);
+updateScene.add(updateMesh);
+
+// ================= 水面渲染 Shader =================
+const waterGeo = new THREE.PlaneGeometry(30, 30, 128, 128);
+waterGeo.rotateX(-Math.PI / 2);
+
+const waterMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uHeightMap: { value: rtA.texture },
+    uTexel: { value: new THREE.Vector2(1.0 / rtSize, 1.0 / rtSize) },
+    uTime: { value: 0 }
+  },
+  vertexShader: `
+    uniform sampler2D uHeightMap;
+    uniform float uTime;
+    varying vec2 vUv;
+    varying float vHeight;
+    varying vec3 vWorldPos;
+    varying vec3 vNormal;
+
+    void main() {
+      vUv = uv;
+      // 采样高度图
+      vec4 h = texture2D(uHeightMap, uv);
+      vec3 pos = position;
+      
+      // 顶点位移 (让水面产生真实的上下起伏)
+      pos.y += h.r * 1.0;
+      vHeight = h.r;
+      
+      // 计算世界坐标
+      vec4 worldPos = modelMatrix * vec4(pos, 1.0);
+      vWorldPos = worldPos.xyz;
+      
+      // 利用相邻像素的高度差，计算表面法线 (用于光学折射)
+      float texel = 1.0 / 256.0;
+      float hL = texture2D(uHeightMap, uv - vec2(texel, 0.0)).r;
+      float hR = texture2D(uHeightMap, uv + vec2(texel, 0.0)).r;
+      float hT = texture2D(uHeightMap, uv + vec2(0.0, texel)).r;
+      float hB = texture2D(uHeightMap, uv - vec2(0.0, texel)).r;
+      
+      vec3 normal = normalize(vec3(hL - hR, 2.0, hT - hB));
+      vNormal = normalize(mat3(modelMatrix) * normal);
+      
+      gl_Position = projectionMatrix * viewMatrix * worldPos;
+    }
+  `,
+  fragmentShader: `
+    uniform float uTime;
+    varying vec2 vUv;
+    varying float vHeight;
+    varying vec3 vWorldPos;
+    varying vec3 vNormal;
+
+    void main() {
+      // 光照方向 (模拟阳光从右上角斜射)
+      vec3 lightDir = normalize(vec3(3.0, 5.0, 2.0));
+      // 摄像机视线
+      vec3 viewDir = normalize(cameraPosition - vWorldPos);
+      
+      // 漫反射
+      float diff = max(dot(vNormal, lightDir), 0.0);
+      
+      // 高光 (Blinn-Phong，指数越高，光斑越锐利)
+      vec3 halfDir = normalize(lightDir + viewDir);
+      float spec = pow(max(dot(vNormal, halfDir), 0.0), 256.0);
+      
+      // 菲涅尔效应 (视线越平，反射越强)
+      float fresnel = pow(1.0 - max(dot(vNormal, viewDir), 0.0), 5.0);
+      
+      // 基础水色
+      vec3 deepColor = vec3(0.005, 0.02, 0.05);   // 深水区：极深幽蓝
+      vec3 shallowColor = vec3(0.05, 0.25, 0.4);  // 波峰处：透亮青绿
+      
+      // 根据高度混合颜色 (波峰浅，波谷深)
+      float depthFactor = smoothstep(-0.3, 0.3, vHeight);
+      vec3 waterColor = mix(deepColor, shallowColor, depthFactor);
+      
+      // 模拟天空的反射色
+      vec3 skyColor = vec3(0.15, 0.3, 0.45);
+      
+      // 核心合成：水色 + 反射色 + 高光
+      vec3 finalColor = mix(waterColor, skyColor, fresnel);
+      finalColor += vec3(1.0) * spec * 2.5; // 耀眼的阳光高光
+      
+      // 边缘微微发光，增强波纹立体感
+      float edgeLight = smoothstep(0.1, 0.5, vHeight);
+      finalColor += vec3(0.0, 0.1, 0.2) * edgeLight;
+
+      // 距离雾化 (远处融入深色背景)
+      float distToCam = length(cameraPosition - vWorldPos);
+      finalColor = mix(finalColor, vec3(0.007, 0.02, 0.04), smoothstep(8.0, 20.0, distToCam));
+
+      gl_FragColor = vec4(finalColor, 1.0);
+    }
+  `
+});
+
+const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+scene.add(waterMesh);
+
+// ================= 交互逻辑 =================
+let pointerIsDown = false;
+let pointerUV = new THREE.Vector2(0.5, 0.5);
+
+// 1. 鼠标/触摸
+window.addEventListener('pointerdown', e => { 
+  pointerIsDown = true; 
+  pointerUV.set(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight); 
+});
+window.addEventListener('pointerup', () => pointerIsDown = false);
+window.addEventListener('pointercancel', () => pointerIsDown = false);
+window.addEventListener('pointermove', e => {
+  if (pointerIsDown) {
+    pointerUV.set(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight);
+  }
+});
+
+// 2. MediaPipe 手势
+const videoEl = document.getElementById('cam');
+const previewWrap = document.getElementById('previewWrap');
+const previewCv = document.getElementById('preview');
+const pctx = previewCv.getContext('2d');
+const CDN = 'https://fastly.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240';
+
+async function initHands() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+    videoEl.srcObject = stream; await videoEl.play();
+  } catch (err) { console.warn('摄像头未授权'); return; }
+  
+  if (typeof window.Hands === 'undefined') return;
+  
+  const hands = new window.Hands({ locateFile: (file) => `${CDN}/${file}` });
+  hands.setOptions({ maxNumHands: 1, modelComplexity: 0 });
+  
+  hands.onResults((results) => {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      const lm = results.multiHandLandmarks[0];
+      const indexTip = lm[8]; // 食指指尖
+      
+      // 镜像并映射到水面
+      pointerUV.set(1.0 - indexTip.x, 1.0 - indexTip.y);
+      pointerIsDown = true; // 手掌在水面上空视为触碰
+      
+      drawPreview(lm);
+      previewWrap.classList.add('active');
+    } else {
+      pointerIsDown = false;
+      drawPreview(null);
+    }
+  });
+
+  (async function pump() {
+    if (videoEl.readyState >= 2) { try { await hands.send({ image: videoEl }); } catch (e) {} }
+    requestAnimationFrame(pump);
+  })();
+}
+
+// 绘制右下角预览
+const HAND_CONNECTIONS = window.HAND_CONNECTIONS || [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawPreview(lm) {
+  const W = previewCv.width, H = previewCv.height; 
+  pctx.clearRect(0, 0, W, H);
+  if (videoEl.readyState >= 2) { pctx.drawImage(videoEl, 0, 0, W, H); pctx.fillStyle = 'rgba(0, 10, 20, 0.5)'; pctx.fillRect(0, 0, W, H); }
+  if (!lm) return;
+  pctx.lineWidth = 2; pctx.strokeStyle = 'rgba(100, 255, 218, 0.8)'; pctx.beginPath();
+  for (const [a, b] of HAND_CONNECTIONS) { pctx.moveTo(lm[a].x * W, lm[a].y * H); pctx.lineTo(lm[b].x * W, lm[b].y * H); }
+  pctx.stroke();
+  for (let i = 0; i < lm.length; i++) {
+    pctx.beginPath(); pctx.arc(lm[i].x * W, lm[i].y * H, (i === 8) ? 3.5 : 2, 0, Math.PI * 2);
+    pctx.fillStyle = i === 8 ? '#64ffda' : '#fff'; pctx.fill();
+  }
+}
+
+// ================= 主循环 =================
+const clock = new THREE.Clock();
+let frame = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const time = clock.getElapsedTime();
+
+  // 1. 更新水波高度场 (Ping-Pong)
+  updateMat.uniforms.uPrev.value = rtB.texture;
+  updateMat.uniforms.uCurrent.value = rtA.texture;
+  updateMat.uniforms.uMouse.value.copy(pointerUV);
+  updateMat.uniforms.uIsTouching.value = pointerIsDown ? 1.0 : 0.0;
+  
+  renderer.setRenderTarget(rtB);
+  renderer.render(updateScene, updateCamera);
+  
+  // 交换 A 和 B
+  const temp = rtA;
+  rtA = rtB;
+  rtB = temp;
+
+  // 2. 渲染真实水面
+  waterMat.uniforms.uHeightMap.value = rtA.texture;
+  waterMat.uniforms.uTime.value = time;
+  
+  renderer.setRenderTarget(null);
+  renderer.render(scene, camera);
+}
+
+// 窗口缩放
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  updateMat.uniforms.uAspect.value = window.innerWidth / window.innerHeight;
+});
+
+// 启动
+initHands().finally(() => setTimeout(() => document.getElementById('loading').classList.add('done'), 500));
+setTimeout(() => document.getElementById('loading').classList.add('done'), 3000);
+animate();
+</script>
+</body>
+</html>
