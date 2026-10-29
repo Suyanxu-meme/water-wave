@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>触碰水面 · 真实水波纹</title>
+<title>触碰水面 · 极简水波</title>
 <style>
   :root { color-scheme: dark; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -13,7 +13,7 @@
   #cam { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
   
   .hud { position: fixed; top: 24px; left: 24px; padding: 16px 20px; border-radius: 16px; background: rgba(5, 15, 30, 0.5); border: 1px solid rgba(100, 200, 255, 0.15); backdrop-filter: blur(10px); pointer-events: none; z-index: 10; }
-  .hud .title { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: #a0e0ff; text-shadow: 0 0 10px rgba(100, 200, 255, 0.5); }
+  .hud .title { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: #a0e0ff; }
   .hud .sub { margin-top: 6px; font-size: 11px; color: rgba(200, 240, 255, 0.6); }
   
   .preview-wrap { position: fixed; right: 20px; bottom: 20px; width: 160px; height: 120px; border-radius: 12px; overflow: hidden; border: 1px solid rgba(100, 200, 255, 0.2); box-shadow: 0 10px 30px rgba(0,0,0,0.5); background: #000; transition: opacity 0.5s ease; transform: scaleX(-1); z-index: 10; opacity: 0; }
@@ -41,24 +41,25 @@
 <div class="preview-wrap" id="previewWrap"><canvas id="preview" width="160" height="120"></canvas></div>
 <div id="loading"><div class="spinner"></div><div class="text">正在注水…</div></div>
 
-<script src="https://fastly.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
 <script type="importmap">
 {
   "imports": {
-    "three": "https://fastly.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
   }
 }
 </script>
 <script type="module">
 import * as THREE from 'three';
 
+// 1. 基础设置
 const container = document.getElementById('app');
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x02060d);
-scene.fog = new THREE.FogExp2(0x02060d, 0.05);
+scene.fog = new THREE.FogExp2(0x02060d, 0.04);
 
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
-camera.position.set(0, 3.5, 6);
+camera.position.set(0, 2.5, 5);
 camera.lookAt(0, 0, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
@@ -66,155 +67,83 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 container.appendChild(renderer.domElement);
 
-// 修复：使用 HalfFloatType 兼容性更好
-const rtSize = 256;
-const rtOptions = {
-  minFilter: THREE.LinearFilter,
-  magFilter: THREE.LinearFilter,
-  format: THREE.RGBAFormat,
-  type: THREE.HalfFloatType, 
-  depthBuffer: false,
-  stencilBuffer: false
-};
-
-let rtA = new THREE.WebGLRenderTarget(rtSize, rtSize, rtOptions);
-let rtB = new THREE.WebGLRenderTarget(rtSize, rtSize, rtOptions);
-
-renderer.setRenderTarget(rtA); renderer.clear();
-renderer.setRenderTarget(rtB); renderer.clear();
-renderer.setRenderTarget(null);
-
-const updateScene = new THREE.Scene();
-const updateCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-const updateGeo = new THREE.PlaneGeometry(2, 2);
-
-const updateMat = new THREE.ShaderMaterial({
-  uniforms: {
-    uPrev: { value: null },
-    uCurrent: { value: null },
-    uMouse: { value: new THREE.Vector2(0.5, 0.5) },
-    uIsTouching: { value: 0.0 },
-    uAspect: { value: window.innerWidth / window.innerHeight },
-    uTime: { value: 0 }
-  },
-  vertexShader: `
-    varying vec2 vUv;
-    void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
-  `,
-  fragmentShader: `
-    uniform sampler2D uPrev;
-    uniform sampler2D uCurrent;
-    uniform vec2 uMouse;
-    uniform float uIsTouching;
-    uniform float uAspect;
-    uniform float uTime;
-    varying vec2 vUv;
-
-    void main() {
-      vec2 texel = vec2(1.0 / 256.0, 1.0 / 256.0);
-      float prev = texture2D(uPrev, vUv).r;
-      float left = texture2D(uCurrent, vUv - vec2(texel.x, 0.0)).r;
-      float right = texture2D(uCurrent, vUv + vec2(texel.x, 0.0)).r;
-      float top = texture2D(uCurrent, vUv - vec2(0.0, texel.y)).r;
-      float bottom = texture2D(uCurrent, vUv + vec2(0.0, texel.y)).r;
-      
-      // 核心波动方程
-      float newHeight = (left + right + top + bottom) / 2.0 - prev;
-      newHeight *= 0.96; // 阻尼
-      
-      // 加入持续的微风，避免死水
-      newHeight += sin(vUv.x * 40.0 + uTime * 2.0) * cos(vUv.y * 40.0 + uTime * 1.5) * 0.0005;
-      
-      // 触摸产生波纹 (扩大作用范围)
-      if (uIsTouching > 0.0) {
-        vec2 dir = vUv - uMouse;
-        dir.x *= uAspect;
-        float dist = length(dir);
-        float brush = smoothstep(0.1, 0.0, dist); // 扩大到 0.1
-        newHeight -= brush * 3.0; // 加大按压力度
-      }
-      
-      gl_FragColor = vec4(newHeight, 0.0, 0.0, 1.0);
-    }
-  `
-});
-
-const updateMesh = new THREE.Mesh(updateGeo, updateMat);
-updateScene.add(updateMesh);
-
-const waterGeo = new THREE.PlaneGeometry(30, 30, 128, 128);
+// 2. 水面材质 (纯 Shader 渲染)
+const waterGeo = new THREE.PlaneGeometry(40, 40, 256, 256);
 waterGeo.rotateX(-Math.PI / 2);
 
 const waterMat = new THREE.ShaderMaterial({
   uniforms: {
-    uHeightMap: { value: rtA.texture }
+    uTime: { value: 0 },
+    uMouse: { value: new THREE.Vector2(0.5, 0.5) },
+    uIsTouching: { value: 0.0 }
   },
   vertexShader: `
-    uniform sampler2D uHeightMap;
-    varying vec2 vUv;
-    varying float vHeight;
-    varying vec3 vWorldPos;
+    uniform float uTime;
+    uniform vec2 uMouse;
+    uniform float uIsTouching;
     varying vec3 vNormal;
+    varying vec3 vWorldPos;
+    varying float vElevation;
 
     void main() {
-      vUv = uv;
-      vec4 h = texture2D(uHeightMap, uv);
       vec3 pos = position;
-      // 放大位移，让水波肉眼可见
-      pos.y += h.r * 2.0;
-      vHeight = h.r;
       
+      // 基础连绵不断的微波
+      float wave = sin(pos.x * 1.5 + uTime) * 0.1;
+      wave += cos(pos.z * 1.2 + uTime * 0.8) * 0.1;
+      
+      // 鼠标/手势触摸产生的波纹（以鼠标坐标为中心的圆形波）
+      vec2 mousePos = (uMouse - 0.5) * 40.0; // 映射到 40x40 的平面
+      float dist = distance(pos.xz, mousePos);
+      float ripple = sin(dist * 2.0 - uTime * 8.0) * 0.5;
+      ripple *= smoothstep(6.0, 0.0, dist) * uIsTouching; // 距离越近波纹越强
+      
+      pos.y += wave + ripple;
+      vElevation = pos.y;
+
+      // 计算法线 (用于光照)
+      float dx = cos(pos.x * 1.5 + uTime) * 1.5 * 0.1;
+      float dz = -sin(pos.z * 1.2 + uTime * 0.8) * 1.2 * 0.1;
+      vNormal = normalize(vec3(-dx, 1.0, -dz));
+
       vec4 worldPos = modelMatrix * vec4(pos, 1.0);
       vWorldPos = worldPos.xyz;
-      
-      float texel = 1.0 / 256.0;
-      float hL = texture2D(uHeightMap, uv - vec2(texel, 0.0)).r;
-      float hR = texture2D(uHeightMap, uv + vec2(texel, 0.0)).r;
-      float hT = texture2D(uHeightMap, uv + vec2(0.0, texel)).r;
-      float hB = texture2D(uHeightMap, uv - vec2(0.0, texel)).r;
-      
-      // 修复：放大法线倾斜度，让光影明显
-      vec3 normal = normalize(vec3((hL - hR) * 20.0, 0.2, (hT - hB) * 20.0));
-      vNormal = normalize(mat3(modelMatrix) * normal);
-      
       gl_Position = projectionMatrix * viewMatrix * worldPos;
     }
   `,
   fragmentShader: `
-    varying vec2 vUv;
-    varying float vHeight;
-    varying vec3 vWorldPos;
+    uniform float uTime;
     varying vec3 vNormal;
+    varying vec3 vWorldPos;
+    varying float vElevation;
 
     void main() {
-      vec3 lightDir = normalize(vec3(3.0, 5.0, 2.0));
+      // 光照与视角
+      vec3 lightDir = normalize(vec3(2.0, 5.0, 2.0));
       vec3 viewDir = normalize(cameraPosition - vWorldPos);
       
-      // 高光锐化
+      // 漫反射与高光
       vec3 halfDir = normalize(lightDir + viewDir);
       float spec = pow(max(dot(vNormal, halfDir), 0.0), 128.0);
       
-      // 菲涅尔反射
+      // 菲涅尔反射 (视线越平，水面越像镜子反射天空)
       float fresnel = pow(1.0 - max(dot(vNormal, viewDir), 0.0), 4.0);
       
-      vec3 deepColor = vec3(0.005, 0.02, 0.05);
-      vec3 shallowColor = vec3(0.05, 0.25, 0.4);
+      // 颜色混合
+      vec3 deepColor = vec3(0.01, 0.03, 0.08);    // 深水
+      vec3 shallowColor = vec3(0.1, 0.3, 0.4);    // 浅水
+      vec3 skyColor = vec3(0.2, 0.4, 0.6);        // 天空反射色
       
-      // 波峰波谷颜色差异
-      float depthFactor = smoothstep(-0.2, 0.2, vHeight);
-      vec3 waterColor = mix(deepColor, shallowColor, depthFactor);
-      vec3 skyColor = vec3(0.15, 0.3, 0.45); // 天空反射
+      // 根据波峰波谷混合深水和浅水
+      vec3 waterColor = mix(deepColor, shallowColor, smoothstep(-0.1, 0.2, vElevation));
       
+      // 最终合成：水色 + 天空反射 + 太阳高光
       vec3 finalColor = mix(waterColor, skyColor, fresnel);
-      finalColor += vec3(1.0) * spec * 3.0; // 高光
-      
-      // 边缘提亮
-      float edgeLight = smoothstep(0.0, 0.2, vHeight);
-      finalColor += vec3(0.0, 0.1, 0.2) * edgeLight;
+      finalColor += vec3(1.0) * spec * 3.0;
 
-      // 远处雾化
+      // 远处雾化融入背景
       float distToCam = length(cameraPosition - vWorldPos);
-      finalColor = mix(finalColor, vec3(0.007, 0.02, 0.04), smoothstep(8.0, 20.0, distToCam));
+      finalColor = mix(finalColor, vec3(0.01, 0.02, 0.05), smoothstep(6.0, 18.0, distToCam));
 
       gl_FragColor = vec4(finalColor, 1.0);
     }
@@ -224,29 +153,28 @@ const waterMat = new THREE.ShaderMaterial({
 const waterMesh = new THREE.Mesh(waterGeo, waterMat);
 scene.add(waterMesh);
 
+// 3. 鼠标与触摸事件
 let pointerIsDown = false;
 let pointerUV = new THREE.Vector2(0.5, 0.5);
 
-// 修复：将事件绑定到 window 捕获阶段，防止被遮挡
 window.addEventListener('pointerdown', e => { 
   pointerIsDown = true; 
   pointerUV.set(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight); 
 }, true);
-
 window.addEventListener('pointerup', () => pointerIsDown = false, true);
 window.addEventListener('pointercancel', () => pointerIsDown = false, true);
-
 window.addEventListener('pointermove', e => {
   if (pointerIsDown) {
     pointerUV.set(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight);
   }
 }, true);
 
+// 4. 手势识别
 const videoEl = document.getElementById('cam');
 const previewWrap = document.getElementById('previewWrap');
 const previewCv = document.getElementById('preview');
 const pctx = previewCv.getContext('2d');
-const CDN = 'https://fastly.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240';
+const CDN = 'https://unpkg.com/@mediapipe/hands@0.4.1675469240';
 
 async function initHands() {
   try {
@@ -263,7 +191,6 @@ async function initHands() {
     if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
       const lm = results.multiHandLandmarks[0];
       const indexTip = lm[8];
-      // 映射指尖位置
       pointerUV.set(1.0 - indexTip.x, 1.0 - indexTip.y);
       pointerIsDown = true;
       drawPreview(lm);
@@ -272,8 +199,9 @@ async function initHands() {
       pointerIsDown = false;
       drawPreview(null);
     }
-  }
-                    (async function pump() {
+  });
+
+  (async function pump() {
     if (videoEl.readyState >= 2) { try { await hands.send({ image: videoEl }); } catch (e) {} }
     requestAnimationFrame(pump);
   })();
@@ -294,29 +222,20 @@ function drawPreview(lm) {
   }
 }
 
+// 5. 动画主循环
 const clock = new THREE.Clock();
 
 function animate() {
   requestAnimationFrame(animate);
-  const dt = Math.min(clock.getDelta(), 0.05);
   const time = clock.getElapsedTime();
 
-  updateMat.uniforms.uPrev.value = rtB.texture;
-  updateMat.uniforms.uCurrent.value = rtA.texture;
-  updateMat.uniforms.uMouse.value.copy(pointerUV);
-  updateMat.uniforms.uIsTouching.value = pointerIsDown ? 1.0 : 0.0;
-  updateMat.uniforms.uTime.value = time;
-  
-  renderer.setRenderTarget(rtB);
-  renderer.render(updateScene, updateCamera);
-  
-  const temp = rtA;
-  rtA = rtB;
-  rtB = temp;
+  waterMat.uniforms.uTime.value = time;
+  // 平滑鼠标坐标
+  waterMat.uniforms.uMouse.value.lerp(pointerUV, 0.1);
+  // 平滑触摸强度
+  const targetTouch = pointerIsDown ? 1.0 : 0.0;
+  waterMat.uniforms.uIsTouching.value += (targetTouch - waterMat.uniforms.uIsTouching.value) * 0.1;
 
-  waterMat.uniforms.uHeightMap.value = rtA.texture;
-  
-  renderer.setRenderTarget(null);
   renderer.render(scene, camera);
 }
 
@@ -325,11 +244,10 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  updateMat.uniforms.uAspect.value = window.innerWidth / window.innerHeight;
 });
 
 initHands().finally(() => setTimeout(() => document.getElementById('loading').classList.add('done'), 500));
-setTimeout(() => { document.getElementById('loading').classList.add('done'); }, 3000);
+setTimeout(() => document.getElementById('loading').classList.add('done'), 3000);
 animate();
 </script>
 </body>
