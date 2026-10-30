@@ -3,39 +3,41 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>镜头水膜 · 手势交互</title>
+<title>纯净水膜 · 玻璃折射</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
   body { font-family: -apple-system, sans-serif; color: #fff; }
   #app { position: fixed; inset: 0; touch-action: none; }
   #cam { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #trailCanvas { display: none; }
   
-  .hud { position: fixed; top: 24px; left: 24px; padding: 16px 20px; border-radius: 16px; background: rgba(20, 5, 15, 0.4); border: 1px solid rgba(255, 100, 150, 0.2); backdrop-filter: blur(10px); pointer-events: none; z-index: 10; }
-  .hud .title { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: #ff8cb0; text-shadow: 0 0 10px rgba(255, 100, 150, 0.5); }
-  .hud .sub { margin-top: 6px; font-size: 11px; color: rgba(255, 200, 220, 0.6); }
+  .hud { position: fixed; top: 24px; left: 24px; padding: 16px 20px; border-radius: 16px; background: rgba(10, 15, 25, 0.5); border: 1px solid rgba(200, 220, 255, 0.2); backdrop-filter: blur(10px); pointer-events: none; z-index: 10; }
+  .hud .title { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: #e0f0ff; text-shadow: 0 0 10px rgba(200, 220, 255, 0.5); }
+  .hud .sub { margin-top: 6px; font-size: 11px; color: rgba(220, 230, 255, 0.6); }
   
-  .preview-wrap { position: fixed; right: 20px; bottom: 20px; width: 140px; height: 105px; border-radius: 12px; overflow: hidden; border: 1px solid rgba(255, 100, 150, 0.3); box-shadow: 0 10px 30px rgba(0,0,0,0.5); background: #000; transition: opacity 0.5s ease; transform: scaleX(-1); z-index: 10; opacity: 0; }
+  .preview-wrap { position: fixed; right: 20px; bottom: 20px; width: 140px; height: 105px; border-radius: 12px; overflow: hidden; border: 1px solid rgba(200, 220, 255, 0.3); box-shadow: 0 10px 30px rgba(0,0,0,0.5); background: #000; transition: opacity 0.5s ease; transform: scaleX(-1); z-index: 10; opacity: 0; }
   .preview-wrap.active { opacity: 1; }
   #preview { display: block; width: 100%; height: 100%; }
   
   #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000; z-index: 50; transition: opacity 0.8s ease; }
   #loading.done { opacity: 0; pointer-events: none; }
-  .spinner { width: 40px; height: 40px; border-radius: 50%; border: 2px solid rgba(255, 100, 150, 0.2); border-top-color: #ff8cb0; animation: spin 1s linear infinite; margin-bottom: 16px; }
+  .spinner { width: 40px; height: 40px; border-radius: 50%; border: 2px solid rgba(200, 220, 255, 0.2); border-top-color: #e0f0ff; animation: spin 1s linear infinite; margin-bottom: 16px; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .text { font-size: 13px; letter-spacing: 2px; color: #ff8cb0; }
+  .text { font-size: 13px; letter-spacing: 2px; color: #e0f0ff; }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <video id="cam" playsinline muted autoplay></video>
+<canvas id="trailCanvas"></canvas>
 
 <div class="hud">
-  <div class="title">幻水镜像</div>
-  <div class="sub">滑动屏幕或挥动手指 · 拨开镜头水膜</div>
+  <div class="title">纯净水膜</div>
+  <div class="sub">滑动屏幕或挥手 · 划开透明水膜</div>
 </div>
 <div class="preview-wrap" id="previewWrap"><canvas id="preview" width="140" height="105"></canvas></div>
-<div id="loading"><div class="spinner"></div><div class="text">正在连接水面…</div></div>
+<div id="loading"><div class="spinner"></div><div class="text">正在生成水面…</div></div>
 
 <script src="https://unpkg.com/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
 <script type="importmap">
@@ -48,10 +50,9 @@
 <script type="module">
 import * as THREE from 'three';
 
-// ================= 1. 基础设置 =================
 const container = document.getElementById('app');
 const scene = new THREE.Scene();
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1); // 全屏2D平面
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -59,33 +60,25 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 container.appendChild(renderer.domElement);
 
 const videoEl = document.getElementById('cam');
+
+// 画布：用于记录水面高度（法线）
+const trailCanvas = document.getElementById('trailCanvas');
+const ctx = trailCanvas.getContext('2d', { willReadFrequently: true });
+trailCanvas.width = 512;
+trailCanvas.height = 512;
+
+const trailTexture = new THREE.CanvasTexture(trailCanvas);
+trailTexture.minFilter = THREE.LinearFilter;
+trailTexture.magFilter = THREE.LinearFilter;
+
 let videoTexture = null;
 
-// ================= 2. 流体位移贴图 (Ping-Pong FBO) =================
-// 使用 256x256 的小图来记录水波，性能极高，绝对不会卡加载
-const rtSize = 256;
-const rtOptions = {
-  minFilter: THREE.LinearFilter,
-  magFilter: THREE.LinearFilter,
-  format: THREE.RGBAFormat,
-  type: THREE.UnsignedByteType, // 放弃高精度浮点，确保所有设备兼容
-  depthBuffer: false,
-  stencilBuffer: false
-};
-
-let rtA = new THREE.WebGLRenderTarget(rtSize, rtSize, rtOptions);
-let rtB = new THREE.WebGLRenderTarget(rtSize, rtSize, rtOptions);
-
-// 渲染位移贴图的场景
-const updateScene = new THREE.Scene();
-const updateCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-const updateGeo = new THREE.PlaneGeometry(2, 2);
-
-const updateMat = new THREE.ShaderMaterial({
+// ================= 核心 Shader =================
+const mainMat = new THREE.ShaderMaterial({
   uniforms: {
-    uPrev: { value: null },
-    uMouse: { value: new THREE.Vector2(0.5, 0.5) },
-    uIsTouching: { value: 0.0 },
+    uVideo: { value: null },
+    uTrail: { value: trailTexture },
+    uVideoAspect: { value: 1.0 },
     uAspect: { value: window.innerWidth / window.innerHeight }
   },
   vertexShader: `
@@ -93,69 +86,14 @@ const updateMat = new THREE.ShaderMaterial({
     void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
   `,
   fragmentShader: `
-    uniform sampler2D uPrev;
-    uniform vec2 uMouse;
-    uniform float uIsTouching;
-    uniform float uAspect;
-    varying vec2 vUv;
-
-    void main() {
-      // 读取上一帧的位移值
-      vec4 prev = texture2D(uPrev, vUv);
-      
-      // 模拟扩散和衰减（水膜慢慢恢复平静）
-      // 这里简单地让上一次的位移缩小，形成回弹
-      vec2 disp = prev.rg * 0.95;
-      
-      // 画上新的波纹
-      if (uIsTouching > 0.0) {
-        vec2 dir = vUv - uMouse;
-        dir.x *= uAspect;
-        float dist = length(dir);
-        
-        // 绘制笔刷半径
-        float brush = smoothstep(0.08, 0.0, dist);
-        
-        // 计算偏移方向（向鼠标中心挤压）
-        vec2 offset = normalize(dir + 0.001) * brush * 0.1;
-        
-        // 累加到位移图里
-        disp += offset; 
-      }
-      
-      gl_FragColor = vec4(disp, 0.0, 1.0);
-    }
-  `
-});
-updateScene.add(new THREE.Mesh(updateGeo, updateMat));
-
-// 清空 FBO
-renderer.setRenderTarget(rtA); renderer.clear();
-renderer.setRenderTarget(rtB); renderer.clear();
-renderer.setRenderTarget(null);
-
-// ================= 3. 主渲染：屏幕水膜折射 =================
-const mainGeo = new THREE.PlaneGeometry(2, 2);
-const mainMat = new THREE.ShaderMaterial({
-  uniforms: {
-    uVideo: { value: null },
-    uDisplacement: { value: rtA.texture },
-    uAspect: { value: window.innerWidth / window.innerHeight },
-    uVideoAspect: { value: 1.0 }
-  },
-  vertexShader: `
-    varying vec2 vUv;
-    void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
-  `,
-  fragmentShader: `
     uniform sampler2D uVideo;
-    uniform sampler2D uDisplacement;
-    uniform float uAspect;
+    uniform sampler2D uTrail;
     uniform float uVideoAspect;
+    uniform float uAspect;
     varying vec2 vUv;
 
     void main() {
-      // 1. 处理视频比例的 Cover 效果
+      // 1. 视频 Cover 适配
       vec2 uv = vUv;
       vec2 scale = vec2(1.0);
       if (uAspect > uVideoAspect) {
@@ -165,59 +103,79 @@ const mainMat = new THREE.ShaderMaterial({
       }
       uv = (uv - 0.5) * scale + 0.5;
 
-      // 2. 从位移贴图中采样偏移量
-      vec4 disp = texture2D(uDisplacement, uv);
-      vec2 offset = disp.rg;
-      
-      // 3. 核心：利用偏移量去采样视频，产生水波折射扭曲
-      // 乘以强度系数(1.5)，让扭曲肉眼可见
-      vec2 distortedUv = uv + offset * 1.5;
-      vec4 videoColor = texture2D(uVideo, distortedUv);
+      // 2. 获取高度图信息
+      float trail = texture2D(uTrail, vUv).r;
 
-      // 4. 计算水膜的边缘高光 (发光效果)
-      // 偏移量越大的地方，说明水波越剧烈
-      float distAmount = length(offset);
+      // 3. 计算梯度 (法线)，提取水面的凹凸
+      float texel = 1.0 / 512.0;
+      float tL = texture2D(uTrail, vUv - vec2(texel, 0.0)).r;
+      float tR = texture2D(uTrail, vUv + vec2(texel, 0.0)).r;
+      float tT = texture2D(uTrail, vUv + vec2(0.0, texel)).r;
+      float tB = texture2D(uTrail, vUv - vec2(0.0, texel)).r;
+
+      // 核心梯度
+      vec2 grad = vec2(tL - tR, tT - tB);
       
-      // 计算边缘：通过求导或者直接对偏移量进行阈值处理
-      // 这里我们用简单的强度判断来模拟边缘
-      float edge = smoothstep(0.005, 0.02, distAmount);
+      // 4. 强力折射扭曲 (模拟玻璃球)
+      // 使用 1.5 的放大系数，手一划，背后的世界就像被水珠放大一样扭曲
+      vec2 distortedUv = uv + grad * 1.5;
+
+      // 5. 色散效果 (RGB 分离，极微弱)
+      // 水有厚度，不同波长的光折射率不同，加了这个才像水
+      vec2 chromatic = grad * 0.05; 
+      float r = texture2D(uVideo, distortedUv + chromatic).r;
+      float g = texture2D(uVideo, distortedUv).g;
+      float b = texture2D(uVideo, distortedUv - chromatic).b;
+      vec3 videoColor = vec3(r, g, b);
+
+      // 6. 边缘高光 (纯白色 / 极淡的银色)
+      float gradMag = length(grad);
       
-      // 截图里的特效有两个颜色：粉色光晕 和 白色高光
-      vec3 pinkGlow = vec3(1.0, 0.3, 0.6); // 粉红色
-      vec3 whiteGlow = vec3(1.0, 0.9, 0.95); // 亮白色
+      // 提取水面边缘(波峰)
+      float whiteEdge = smoothstep(0.05, 0.2, gradMag);
       
-      // 给画面叠加上发光边缘
+      // 叠加纯白高光
       vec3 finalColor = videoColor.rgb;
-      
-      // 边缘叠加粉色光晕
-      finalColor += pinkGlow * edge * 0.5;
-      // 在最极端的边缘叠加白色高光
-      finalColor += whiteGlow * smoothstep(0.02, 0.04, distAmount) * 0.8;
+      finalColor += vec3(1.0) * whiteEdge * 0.8;
+
+      // 增加水内部的通透提亮（一点点就行，保持完全透明）
+      finalColor += vec3(0.02) * smoothstep(0.0, 1.0, trail);
+
+      // 7. 极其轻微的暗角，凸显水膜中心
+      float distToCenter = distance(vUv, vec2(0.5));
+      finalColor *= smoothstep(1.0, 0.3, distToCenter);
 
       gl_FragColor = vec4(finalColor, 1.0);
     }
   `
 });
-const mainMesh = new THREE.Mesh(mainGeo, mainMat);
+
+const mainMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mainMat);
 scene.add(mainMesh);
 
-// ================= 4. 交互控制 =================
-let pointerIsDown = false;
-let pointerUV = new THREE.Vector2(0.5, 0.5);
+// ================= 交互：绘制水膜 =================
+function addPointer(x, y) {
+  const nx = x;
+  const ny = 1.0 - y; 
+  
+  // 画笔加大到 35，让水膜更大、更连片
+  ctx.beginPath();
+  ctx.arc(nx * 512, ny * 512, 35, 0, Math.PI * 2); 
+  ctx.fillStyle = 'rgba(255, 255, 255, 1)';
+  ctx.fill();
+}
 
 window.addEventListener('pointerdown', e => { 
-  pointerIsDown = true; 
-  pointerUV.set(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight); 
+  addPointer(e.clientX / window.innerWidth, e.clientY / window.innerHeight);
 }, true);
-window.addEventListener('pointerup', () => pointerIsDown = false, true);
-window.addEventListener('pointercancel', () => pointerIsDown = false, true);
+
 window.addEventListener('pointermove', e => {
-  if (pointerIsDown) {
-    pointerUV.set(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight);
+  if (e.buttons === 1 || e.pointerType === 'touch') { // 左键按下或触摸
+    addPointer(e.clientX / window.innerWidth, e.clientY / window.innerHeight);
   }
 }, true);
 
-// ================= 5. MediaPipe 手势 =================
+// ================= MediaPipe 手势 =================
 const previewWrap = document.getElementById('previewWrap');
 const previewCv = document.getElementById('preview');
 const pctx = previewCv.getContext('2d');
@@ -228,16 +186,16 @@ async function initHands() {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
     videoEl.srcObject = stream; await videoEl.play();
     
-    // 视频加载后创建纹理
     videoTexture = new THREE.VideoTexture(videoEl);
-    videoTexture.minFilter = THREE.LinearFilter;
-    videoTexture.magFilter = THREE.LinearFilter;
     mainMat.uniforms.uVideo.value = videoTexture;
     
-    // 计算并传递视频的实际比例
-    videoEl.addEventListener('loadedmetadata', () => {
+    const aspectUpdate = () => {
+      if (videoEl.videoWidth > 0) {
         mainMat.uniforms.uVideoAspect.value = videoEl.videoWidth / videoEl.videoHeight;
-    });
+      }
+    };
+    videoEl.addEventListener('loadedmetadata', aspectUpdate);
+    aspectUpdate();
     
   } catch (err) { console.warn('摄像头未授权'); return; }
   
@@ -251,14 +209,12 @@ async function initHands() {
       const lm = results.multiHandLandmarks[0];
       const indexTip = lm[8];
       
-      // 映射到 UV 坐标
-      pointerUV.set(1.0 - indexTip.x, 1.0 - indexTip.y);
-      pointerIsDown = true; // 挥手等同于一直按压
+      // 指尖划过水面
+      addPointer(1.0 - indexTip.x, indexTip.y);
       
       drawPreview(lm);
       previewWrap.classList.add('active');
     } else {
-      pointerIsDown = false;
       drawPreview(null);
     }
   });
@@ -275,45 +231,32 @@ function drawPreview(lm) {
   pctx.clearRect(0, 0, W, H);
   if (videoEl.readyState >= 2) { pctx.drawImage(videoEl, 0, 0, W, H); pctx.fillStyle = 'rgba(0, 0, 0, 0.4)'; pctx.fillRect(0, 0, W, H); }
   if (!lm) return;
-  pctx.lineWidth = 2; pctx.strokeStyle = 'rgba(255, 140, 176, 0.8)'; pctx.beginPath();
-  for (const [a, b] of TIONS) { pctx.moveTo(lm[a].x * W, lm[a].y * H); pctx.lineTo(lm[b].x * W, lm[b].y * H); }
+  pctx.lineWidth = 2; pctx.strokeStyle = 'rgba(200, 220, 255, 0.8)'; pctx.beginPath();
+  for (const [a, b] of HAND_CONNECTIONS) { pctx.moveTo(lm[a].x * W, lm[a].y * H); pctx.lineTo(lm[b].x * W, lm[b].y * H); }
   pctx.stroke();
   for (let i = 0; i < lm.length; i++) {
     pctx.beginPath(); pctx.arc(lm[i].x * W, lm[i].y * H, (i === 8) ? 3.5 : 2, 0, Math.PI * 2);
-    pctx.fillStyle = i === 8 ? '#ff8cb0' : '#fff'; pctx.fill();
+    pctx.fillStyle = i === 8 ? '#fff' : 'rgba(255,255,255,0.8)'; pctx.fill();
   }
 }
 
-// ================= 6. 渲染循环 =================
+// ================= 动画与消散 =================
 function animate() {
   requestAnimationFrame(animate);
 
-  // 1. 将画笔轨迹绘制到水面偏移图
-  updateMat.uniforms.uPrev.value = rtA.texture;
-  updateMat.uniforms.uMouse.value.copy(pointerUV);
-  updateMat.uniforms.uIsTouching.value = pointerIsDown ? 1.0 : 0.0;
-  
-  renderer.setRenderTarget(rtB);
-  renderer.render(updateScene, updateCamera);
-  
-  // 交换渲染目标
-  const temp = rtA;
-  rtA = rtB;
-  rtB = temp;
+  // 每隔一帧擦除一点点，让水膜保留，形成连贯的液体感 (从 0.02 调整为 0.03)
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.03)';
+  ctx.fillRect(0, 0, 512, 512);
 
-  // 2. 渲染最终画面 (将偏移图传给主 Shader 产生折射)
-  mainMat.uniforms.uDisplacement.value = rtA.texture;
-  renderer.setRenderTarget(null);
+  trailTexture.needsUpdate = true;
   renderer.render(scene, camera);
 }
 
 window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
-  updateMat.uniforms.uAspect.value = window.innerWidth / window.innerHeight;
   mainMat.uniforms.uAspect.value = window.innerWidth / window.innerHeight;
 });
 
-// 启动
 initHands().finally(() => setTimeout(() => document.getElementById('loading').classList.add('done'), 500));
 setTimeout(() => { document.getElementById('loading').classList.add('done'); }, 3000);
 animate();
